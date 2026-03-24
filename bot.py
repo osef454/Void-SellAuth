@@ -88,20 +88,38 @@ def build_embed(invoice: dict) -> discord.Embed:
     inv_id   = invoice.get("id", "N/A")
     email    = invoice.get("email", "N/A")
     price    = invoice.get("price", "N/A")
-    paid     = invoice.get("paid", None)
     currency = invoice.get("currency", "EUR")
 
-    # Nom du/des produit(s) — plusieurs formats possibles selon l'API
-    raw_products = invoice.get("products", invoice.get("product", ""))
-    if isinstance(raw_products, list):
-        product_name = ", ".join(
-            p.get("name", str(p)) if isinstance(p, dict) else str(p)
-            for p in raw_products
-        )
-    elif isinstance(raw_products, dict):
-        product_name = raw_products.get("name", "N/A")
-    else:
-        product_name = str(raw_products) if raw_products else "N/A"
+    # Nom du/des produit(s) — on essaie tous les champs possibles de l'API SellAuth
+    product_name = ""
+
+    # 1. Champ plat direct (le plus courant)
+    for key in ("product_title", "title", "name"):
+        val = invoice.get(key)
+        if val and isinstance(val, str):
+            product_name = val
+            break
+
+    # 2. Objet "product" ou tableau "products"
+    if not product_name:
+        raw = invoice.get("products") or invoice.get("product")
+        if isinstance(raw, list) and raw:
+            names = []
+            for p in raw:
+                if isinstance(p, dict):
+                    names.append(p.get("title") or p.get("name") or str(p))
+                else:
+                    names.append(str(p))
+            product_name = ", ".join(n for n in names if n)
+        elif isinstance(raw, dict):
+            product_name = raw.get("title") or raw.get("name") or ""
+        elif isinstance(raw, str) and raw:
+            product_name = raw
+
+    product_name = product_name or "N/A"
+
+    # Payé : on se base sur le statut — "completed" = paiement confirmé
+    is_paid = invoice.get("status", "").lower() == "completed"
 
     # Méthode de paiement
     pm = invoice.get("payment_method", invoice.get("gateway", "N/A"))
@@ -118,15 +136,14 @@ def build_embed(invoice: dict) -> discord.Embed:
         color     = status_color(status),
         timestamp = datetime.now(timezone.utc),
     )
-    embed.add_field(name="🛒 Produit",     value=product_name or "N/A", inline=True)
-    embed.add_field(name=f"💶 Prix",       value=f"{symbol}{price}",    inline=True)
+    embed.add_field(name="🛒 Produit",     value=product_name,          inline=True)
+    embed.add_field(name="💶 Prix",        value=f"{symbol}{price}",    inline=True)
     embed.add_field(name="💳 Paiement",    value=str(pm),               inline=True)
     embed.add_field(name="📧 Email",       value=str(email),            inline=True)
     embed.add_field(name="🕐 Créé le",     value=str(created_at),       inline=True)
+    embed.add_field(name="💰 Payé",        value="✅ Oui" if is_paid else "❌ Non", inline=True)
     if completed_at:
         embed.add_field(name="✅ Complété le", value=str(completed_at),  inline=True)
-    if paid is not None:
-        embed.add_field(name="💰 Payé",    value="Oui" if paid else "Non", inline=True)
     embed.set_footer(text=f"Invoice ID: {inv_id}  •  Shop: {SHOP_ID}")
     return embed
 
@@ -154,6 +171,13 @@ async def poll_loop():
                     seen_ids = {inv["id"] for inv in invoices if "id" in inv}
                     initialized = True
                     print(f"[✓] Initialisation : {len(seen_ids)} facture(s) existante(s) ignorée(s).")
+                    # Debug : affiche les clés d'une facture pour vérifier la structure API
+                    if invoices:
+                        sample = {k: v for k, v in invoices[0].items() if k in (
+                            "id","status","price","currency","email","paid",
+                            "product","products","product_title","title","name","gateway","payment_method"
+                        )}
+                        print(f"[DEBUG] Champs facture exemple : {sample}")
                 else:
                     for inv in invoices:
                         inv_id = inv.get("id")
