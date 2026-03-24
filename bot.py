@@ -7,148 +7,153 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
 SHOP_ID          = os.getenv("SHOP_ID", "218070")
 CHANNEL_ID       = int(os.getenv("CHANNEL_ID", "1481554434168328193"))
-POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "30"))   # secondes entre chaque check
-# Statuts à notifier : "completed" | "completed,pending"
-NOTIFY_STATUSES  = [s.strip().lower() for s in os.getenv("NOTIFY_STATUS", "completed").split(",")]
+POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "30"))
+NOTIFY_STATUSES  = [s.strip().lower() for s in os.getenv("NOTIFY_STATUS", "completed,pending").split(",")]
 
 SELLAUTH_BASE    = "https://api.sellauth.com/v1"
+HEADERS          = lambda: {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Accept": "application/json"}
 
-# ── État interne (en mémoire) ────────────────────────────────────────────────
-seen_ids: set[str] = set()
-initialized       = False
+# ── État interne ─────────────────────────────────────────────────────────────
+seen_ids: set[int] = set()
+initialized        = False
 
-# ── Discord ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 client  = discord.Client(intents=intents)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def status_color(status: str) -> discord.Color:
-    match status.lower():
-        case "completed": return discord.Color.green()
-        case "pending":   return discord.Color.orange()
-        case "expired":   return discord.Color.red()
-        case _:           return discord.Color.blurple()
-
-def status_emoji(status: str) -> str:
-    match status.lower():
-        case "completed": return "✅"
-        case "pending":   return "⏳"
-        case "expired":   return "❌"
-        case _:           return "❓"
-
-
+# ── API helpers ───────────────────────────────────────────────────────────────
 async def fetch_invoices(session: aiohttp.ClientSession) -> list[dict]:
-    """Récupère toutes les factures (page 1 à N) du shop."""
-    headers = {
-        "Authorization": f"Bearer {SELLAUTH_API_KEY}",
-        "Accept":        "application/json",
-    }
-    url     = f"{SELLAUTH_BASE}/shops/{SHOP_ID}/invoices"
-    all_inv = []
-    page    = 1
-
+    url, all_inv, page = f"{SELLAUTH_BASE}/shops/{SHOP_ID}/invoices", [], 1
     while True:
-        params = {"page": page, "per_page": 50}
         try:
-            async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(url, headers=HEADERS(), params={"page": page, "per_page": 50},
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    print(f"[WARN] SellAuth API {resp.status}: {text[:200]}")
+                    print(f"[WARN] invoices list {resp.status}: {(await resp.text())[:200]}")
                     break
                 body = await resp.json()
         except Exception as e:
-            print(f"[ERROR] fetch_invoices: {e}")
-            break
+            print(f"[ERROR] fetch_invoices: {e}"); break
 
-        # Gestion réponse paginée ou tableau brut
-        if isinstance(body, dict):
-            data      = body.get("data", [])
-            last_page = body.get("last_page", 1)
-        else:
-            data      = body
-            last_page = 1
-
+        data      = body.get("data", body) if isinstance(body, dict) else body
+        last_page = body.get("last_page", 1) if isinstance(body, dict) else 1
         all_inv.extend(data)
-
         if page >= last_page:
             break
         page += 1
-
     return all_inv
 
 
-def build_embed(invoice: dict) -> discord.Embed:
-    status   = invoice.get("status", "unknown")
-    inv_id   = invoice.get("id", "N/A")
-    email    = invoice.get("email", "N/A")
-    price    = invoice.get("price", "N/A")
-    currency = invoice.get("currency", "EUR")
+async def fetch_invoice_detail(session: aiohttp.ClientSession, invoice_id: int) -> dict:
+    """Récupère les détails complets d'une facture (contient le produit)."""
+    url = f"{SELLAUTH_BASE}/shops/{SHOP_ID}/invoices/{invoice_id}"
+    try:
+        async with session.get(url, headers=HEADERS(), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            print(f"[WARN] invoice detail {invoice_id} → {resp.status}")
+    except Exception as e:
+        print(f"[ERROR] fetch_invoice_detail {invoice_id}: {e}")
+    return {}
 
-    # Nom du/des produit(s) — on essaie tous les champs possibles de l'API SellAuth
-    product_name = ""
 
-    # 1. Champ plat direct (le plus courant)
+# ── Extraction produit ────────────────────────────────────────────────────────
+def extract_product_name(invoice: dict) -> str:
+    # Champs plats
     for key in ("product_title", "title", "name"):
-        val = invoice.get(key)
-        if val and isinstance(val, str):
-            product_name = val
-            break
+        v = invoice.get(key)
+        if v and isinstance(v, str):
+            return v
 
-    # 2. Objet "product" ou tableau "products"
-    if not product_name:
-        raw = invoice.get("products") or invoice.get("product")
-        if isinstance(raw, list) and raw:
-            names = []
-            for p in raw:
-                if isinstance(p, dict):
-                    names.append(p.get("title") or p.get("name") or str(p))
-                else:
-                    names.append(str(p))
-            product_name = ", ".join(n for n in names if n)
-        elif isinstance(raw, dict):
-            product_name = raw.get("title") or raw.get("name") or ""
-        elif isinstance(raw, str) and raw:
-            product_name = raw
+    # Objet ou liste
+    raw = invoice.get("products") or invoice.get("product")
+    if isinstance(raw, list) and raw:
+        parts = []
+        for p in raw:
+            n = (p.get("title") or p.get("name")) if isinstance(p, dict) else str(p)
+            if n: parts.append(n)
+        return ", ".join(parts) or "N/A"
+    if isinstance(raw, dict):
+        return raw.get("title") or raw.get("name") or "N/A"
+    if isinstance(raw, str) and raw:
+        return raw
 
-    product_name = product_name or "N/A"
+    return "N/A"
 
-    # Payé : on se base sur le statut — "completed" = paiement confirmé
-    is_paid = invoice.get("status", "").lower() == "completed"
+
+# ── Build embed ───────────────────────────────────────────────────────────────
+CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£"}
+
+def status_color(s: str) -> discord.Color:
+    return {"completed": discord.Color.from_rgb(87, 242, 135),
+            "pending":   discord.Color.from_rgb(255, 168, 0),
+            "expired":   discord.Color.from_rgb(237, 66, 69)}.get(s.lower(), discord.Color.blurple())
+
+def status_label(s: str) -> str:
+    return {"completed": "✅  Vente complétée", "pending": "⏳  Paiement en attente",
+            "expired":   "❌  Facture expirée"}.get(s.lower(), f"❓  {s.capitalize()}")
+
+
+def build_embed(invoice: dict) -> discord.Embed:
+    status       = invoice.get("status", "unknown").lower()
+    inv_id       = invoice.get("id", "N/A")
+    email        = invoice.get("email", "N/A")
+    price        = invoice.get("price", "0.00")
+    currency     = str(invoice.get("currency", "EUR")).upper()
+    created_raw  = invoice.get("created_at", "")
+    completed_at = invoice.get("completed_at")
+
+    # Formatage date
+    try:
+        dt = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+        created_fmt = dt.strftime("%d/%m/%Y à %H:%M")
+    except Exception:
+        created_fmt = str(created_raw)
+
+    symbol       = CURRENCY_SYMBOLS.get(currency, currency)
+    product_name = extract_product_name(invoice)
+    is_paid      = status == "completed"
 
     # Méthode de paiement
-    pm = invoice.get("payment_method", invoice.get("gateway", "N/A"))
+    pm = invoice.get("payment_method") or invoice.get("gateway", "N/A")
     if isinstance(pm, dict):
-        pm = pm.get("name", str(pm))
-
-    created_at   = invoice.get("created_at", "N/A")
-    completed_at = invoice.get("completed_at", None)
-
-    symbol = "€" if str(currency).upper() in ("EUR", "€") else str(currency)
+        pm = pm.get("name") or "N/A"
 
     embed = discord.Embed(
-        title     = f"{status_emoji(status)}  Nouvelle vente — {status.capitalize()}",
-        color     = status_color(status),
-        timestamp = datetime.now(timezone.utc),
+        title       = status_label(status),
+        description = f"```\nShop ID : {SHOP_ID}   •   Invoice : {inv_id}\n```",
+        color       = status_color(status),
+        timestamp   = datetime.now(timezone.utc),
     )
-    embed.add_field(name="🛒 Produit",     value=product_name,          inline=True)
-    embed.add_field(name="💶 Prix",        value=f"{symbol}{price}",    inline=True)
-    embed.add_field(name="💳 Paiement",    value=str(pm),               inline=True)
-    embed.add_field(name="📧 Email",       value=str(email),            inline=True)
-    embed.add_field(name="🕐 Créé le",     value=str(created_at),       inline=True)
-    embed.add_field(name="💰 Payé",        value="✅ Oui" if is_paid else "❌ Non", inline=True)
+
+    embed.add_field(name="🛒  Produit",      value=f"**{product_name}**",                    inline=False)
+    embed.add_field(name="💶  Prix",          value=f"**{symbol}{price}**",                   inline=True)
+    embed.add_field(name="💳  Paiement",      value=f"**{pm}**",                              inline=True)
+    embed.add_field(name="💰  Payé",          value="✅ **Oui**" if is_paid else "❌ **Non**", inline=True)
+    embed.add_field(name="📧  Email",         value=f"`{email}`",                             inline=True)
+    embed.add_field(name="🕐  Créé le",       value=created_fmt,                              inline=True)
+
     if completed_at:
-        embed.add_field(name="✅ Complété le", value=str(completed_at),  inline=True)
-    embed.set_footer(text=f"Invoice ID: {inv_id}  •  Shop: {SHOP_ID}")
+        try:
+            dt2 = datetime.fromisoformat(str(completed_at).replace("Z", "+00:00"))
+            completed_fmt = dt2.strftime("%d/%m/%Y à %H:%M")
+        except Exception:
+            completed_fmt = str(completed_at)
+        embed.add_field(name="✅  Complété le", value=completed_fmt, inline=True)
+
+    embed.set_footer(
+        text    = "Void SellAuth  •  Nouvelle transaction",
+        icon_url= "https://sellauth.com/favicon.ico",
+    )
     return embed
 
 
-# ── Boucle de polling ────────────────────────────────────────────────────────
+# ── Polling loop ──────────────────────────────────────────────────────────────
 async def poll_loop():
     global seen_ids, initialized
 
@@ -156,10 +161,10 @@ async def poll_loop():
     channel = client.get_channel(CHANNEL_ID)
 
     if channel is None:
-        print(f"[ERROR] Salon introuvable : {CHANNEL_ID}  —  vérifiez CHANNEL_ID et les permissions.")
+        print(f"[ERROR] Salon introuvable : {CHANNEL_ID}")
         return
 
-    print(f"[✓] Polling SellAuth toutes les {POLL_INTERVAL}s  →  #{channel.name}")
+    print(f"[✓] Polling toutes les {POLL_INTERVAL}s  →  #{channel.name}")
 
     async with aiohttp.ClientSession() as session:
         while not client.is_closed():
@@ -167,17 +172,9 @@ async def poll_loop():
                 invoices = await fetch_invoices(session)
 
                 if not initialized:
-                    # Premier démarrage : on mémorise tout sans notifier
-                    seen_ids = {inv["id"] for inv in invoices if "id" in inv}
+                    seen_ids    = {inv["id"] for inv in invoices if "id" in inv}
                     initialized = True
-                    print(f"[✓] Initialisation : {len(seen_ids)} facture(s) existante(s) ignorée(s).")
-                    # Debug : affiche les clés d'une facture pour vérifier la structure API
-                    if invoices:
-                        sample = {k: v for k, v in invoices[0].items() if k in (
-                            "id","status","price","currency","email","paid",
-                            "product","products","product_title","title","name","gateway","payment_method"
-                        )}
-                        print(f"[DEBUG] Champs facture exemple : {sample}")
+                    print(f"[✓] Init : {len(seen_ids)} facture(s) existante(s) ignorée(s).")
                 else:
                     for inv in invoices:
                         inv_id = inv.get("id")
@@ -188,9 +185,12 @@ async def poll_loop():
                         status = inv.get("status", "").lower()
 
                         if status in NOTIFY_STATUSES:
-                            embed = build_embed(inv)
+                            # Appel détaillé pour récupérer le produit
+                            detail = await fetch_invoice_detail(session, inv_id)
+                            full   = {**inv, **detail} if detail else inv
+                            embed  = build_embed(full)
                             await channel.send(embed=embed)
-                            print(f"[→] Notification envoyée : {inv_id}  ({status})")
+                            print(f"[→] {inv_id}  ({status})  produit: {extract_product_name(full)}")
 
             except Exception as e:
                 print(f"[ERROR] poll_loop: {e}")
@@ -198,23 +198,20 @@ async def poll_loop():
             await asyncio.sleep(POLL_INTERVAL)
 
 
-# ── Events ───────────────────────────────────────────────────────────────────
+# ── Events ────────────────────────────────────────────────────────────────────
 @client.event
 async def on_ready():
-    print(f"[✓] Connecté en tant que {client.user}  (id: {client.user.id})")
+    print(f"[✓] {client.user}  (id: {client.user.id})")
     await client.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="SellAuth Sales 💸"
-        )
+        activity=discord.Activity(type=discord.ActivityType.watching, name="SellAuth Sales 💸")
     )
     asyncio.ensure_future(poll_loop())
 
 
-# ── Lancement ────────────────────────────────────────────────────────────────
+# ── Lancement ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise ValueError("DISCORD_TOKEN manquant dans les variables d'environnement.")
+        raise ValueError("DISCORD_TOKEN manquant.")
     if not SELLAUTH_API_KEY:
-        raise ValueError("SELLAUTH_API_KEY manquant dans les variables d'environnement.")
+        raise ValueError("SELLAUTH_API_KEY manquant.")
     client.run(DISCORD_TOKEN)
