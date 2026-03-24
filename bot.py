@@ -111,58 +111,30 @@ async def fetch_product_name(session: aiohttp.ClientSession, pid: int) -> str:
     return ""
 
 
-# ── Résolution du nom de produit ─────────────────────────────────────────────
-def find_product_ids(obj, depth=0) -> set[int]:
-    """Cherche récursivement tout champ product_id dans un dict/list."""
-    ids = set()
-    if depth > 5:
-        return ids
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ("product_id", "productId") and v is not None:
-                try:
-                    ids.add(int(v))
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(v, (dict, list)):
-                ids |= find_product_ids(v, depth + 1)
-    elif isinstance(obj, list):
-        for item in obj:
-            ids |= find_product_ids(item, depth + 1)
-    return ids
-
-
+# ── Extraction depuis items[] (doc officielle SellAuth) ──────────────────────
 def extract_product_name(invoice: dict) -> str:
-    # 1. Champs directs texte
-    for key in ("product_title", "product_name"):
-        v = invoice.get(key)
-        if v and isinstance(v, str):
-            return v
-
-    # 2. Le champ "products" peut être un string (nom affiché)
-    products_val = invoice.get("products")
-    if isinstance(products_val, str) and products_val.strip():
-        return products_val.strip()
-
-    # 3. "products" peut être une liste d'objets
-    if isinstance(products_val, list) and products_val:
+    """Récupère le nom du produit depuis items[].product.name."""
+    items = invoice.get("items")
+    if isinstance(items, list) and items:
         names = []
-        for p in products_val:
-            if isinstance(p, dict):
-                n = p.get("name") or p.get("title")
-                if n:
-                    names.append(n)
+        for item in items:
+            if isinstance(item, dict):
+                prod = item.get("product")
+                if isinstance(prod, dict):
+                    n = prod.get("name")
+                    if n and n not in names:
+                        names.append(n)
         if names:
             return ", ".join(names)
 
-    # 4. "product" peut être un objet avec un nom
+    # Fallback : champ "product" au top-level (objet ou cache)
     product_val = invoice.get("product")
     if isinstance(product_val, dict):
         n = product_val.get("name") or product_val.get("title")
         if n:
             return n
 
-    # 5. Lookup par product_id dans le cache
+    # Fallback : product_id dans le cache
     pid = invoice.get("product_id")
     if pid is not None:
         try:
@@ -171,24 +143,40 @@ def extract_product_name(invoice: dict) -> str:
         except (ValueError, TypeError):
             pass
 
-    # 6. Rechercher product_id récursivement (items, variants, etc.)
-    pids = find_product_ids(invoice)
-    for pid in pids:
-        if pid in products_cache:
-            return products_cache[pid]
-
-    # 7. Scanner toutes les valeurs int pour match dans le cache produits
-    for k, v in invoice.items():
-        if k in ("id", "shop_id"):
-            continue
-        try:
-            iv = int(v)
-            if iv in products_cache:
-                return products_cache[iv]
-        except (ValueError, TypeError):
-            pass
+    # Fallback : product_id depuis items
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                pid = item.get("product_id")
+                if pid is not None:
+                    try:
+                        if int(pid) in products_cache:
+                            return products_cache[int(pid)]
+                    except (ValueError, TypeError):
+                        pass
 
     return ""
+
+
+def extract_deliverable(invoice: dict) -> str:
+    """Récupère les clés/serials livrés depuis items[].delivered."""
+    items = invoice.get("items")
+    if not isinstance(items, list):
+        return ""
+
+    all_keys = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        delivered = item.get("delivered")
+        if isinstance(delivered, list):
+            for key in delivered:
+                if key and isinstance(key, str):
+                    all_keys.append(key)
+        elif isinstance(delivered, str) and delivered.strip():
+            all_keys.append(delivered.strip())
+
+    return "\n".join(all_keys)
 
 
 # ── Embed ────────────────────────────────────────────────────────────────────
@@ -213,52 +201,6 @@ def format_date(raw) -> str:
         return dt.strftime("%d/%m/%Y à %H:%M")
     except Exception:
         return str(raw) if raw else "N/A"
-
-
-def extract_deliverable(invoice: dict) -> str:
-    """Extrait la clé / licence / deliverable reçue par le client."""
-    # Cherche dans tous les champs possibles
-    for key in ("delivered_product", "deliverable", "deliverables",
-                "serial", "serials", "key", "keys", "license",
-                "license_key", "product_key", "delivery", "delivered"):
-        val = invoice.get(key)
-        if not val:
-            continue
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, list):
-            parts = []
-            for item in val:
-                if isinstance(item, dict):
-                    v = item.get("value") or item.get("key") or item.get("serial") or item.get("content")
-                    if v:
-                        parts.append(str(v))
-                elif item:
-                    parts.append(str(item))
-            if parts:
-                return "\n".join(parts)
-        if isinstance(val, dict):
-            v = val.get("value") or val.get("key") or val.get("serial") or val.get("content")
-            if v:
-                return str(v)
-
-    # Chercher dans les sous-objets (items, product, etc.)
-    for key in ("items", "order_items", "invoice_items"):
-        items = invoice.get(key)
-        if isinstance(items, list):
-            parts = []
-            for item in items:
-                if isinstance(item, dict):
-                    for sub_key in ("delivered_product", "deliverable", "serial",
-                                    "key", "license", "product_key", "value", "content"):
-                        v = item.get(sub_key)
-                        if v and isinstance(v, str) and v.strip():
-                            parts.append(v.strip())
-                            break
-            if parts:
-                return "\n".join(parts)
-
-    return ""
 
 
 def build_embed(invoice: dict, product_name: str) -> discord.Embed:
@@ -294,7 +236,6 @@ def build_embed(invoice: dict, product_name: str) -> discord.Embed:
         embed.add_field(name="✅  Complété le", value=format_date(completed_at), inline=True)
 
     if deliverable:
-        # Tronquer si trop long (limite Discord = 1024 chars par field)
         display = deliverable if len(deliverable) <= 1000 else deliverable[:997] + "..."
         embed.add_field(name="🔑  Clé / Deliverable", value=f"```\n{display}\n```", inline=False)
 
@@ -304,21 +245,20 @@ def build_embed(invoice: dict, product_name: str) -> discord.Embed:
 
 # ── Résolution complète du produit ───────────────────────────────────────────
 async def resolve_product(session: aiohttp.ClientSession, invoice: dict) -> str:
-    # Extraction depuis les données déjà chargées
     name = extract_product_name(invoice)
     if name:
         return name
 
-    # Appel API individuel pour chaque product_id trouvé
-    pids = find_product_ids(invoice)
-    pid_direct = invoice.get("product_id")
-    if pid_direct:
-        pids.add(int(pid_direct))
-
-    for pid in pids:
-        name = await fetch_product_name(session, pid)
-        if name:
-            return name
+    # Dernier recours : appel API produit individuel via items[].product_id
+    items = invoice.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                pid = item.get("product_id")
+                if pid:
+                    n = await fetch_product_name(session, int(pid))
+                    if n:
+                        return n
 
     return "N/A"
 
