@@ -19,8 +19,9 @@ SELLAUTH_BASE    = "https://api.sellauth.com/v1"
 HEADERS          = lambda: {"Authorization": f"Bearer {SELLAUTH_API_KEY}", "Accept": "application/json"}
 
 # ── État interne ─────────────────────────────────────────────────────────────
-seen_ids: set[int] = set()
-initialized        = False
+seen_ids: set[int]      = set()
+products_cache: dict    = {}   # product_id (int) -> name (str)
+initialized             = False
 
 intents = discord.Intents.default()
 client  = discord.Client(intents=intents)
@@ -62,28 +63,85 @@ async def fetch_invoice_detail(session: aiohttp.ClientSession, invoice_id: int) 
     return {}
 
 
+async def fetch_all_products(session: aiohttp.ClientSession) -> dict:
+    """Charge tous les produits du shop → dict {product_id: name}."""
+    url    = f"{SELLAUTH_BASE}/shops/{SHOP_ID}/products"
+    cache  = {}
+    page   = 1
+    while True:
+        try:
+            async with session.get(url, headers=HEADERS(), params={"page": page, "per_page": 100},
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    break
+                body = await resp.json()
+        except Exception as e:
+            print(f"[ERROR] fetch_all_products: {e}"); break
+
+        data      = body.get("data", body) if isinstance(body, dict) else body
+        last_page = body.get("last_page", 1) if isinstance(body, dict) else 1
+        for p in data:
+            pid  = p.get("id")
+            name = p.get("name") or p.get("title") or p.get("label")
+            if pid and name:
+                cache[int(pid)] = name
+        if page >= last_page:
+            break
+        page += 1
+    print(f"[✓] Produits chargés : {len(cache)}  → {list(cache.values())}")
+    return cache
+
+
+async def fetch_product_name(session: aiohttp.ClientSession, product_id: int) -> str:
+    """Récupère le nom d'un produit par son ID (avec mise en cache)."""
+    if product_id in products_cache:
+        return products_cache[product_id]
+    url = f"{SELLAUTH_BASE}/shops/{SHOP_ID}/products/{product_id}"
+    try:
+        async with session.get(url, headers=HEADERS(), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                name = data.get("name") or data.get("title") or data.get("label")
+                if name:
+                    products_cache[product_id] = name
+                    return name
+    except Exception as e:
+        print(f"[ERROR] fetch_product_name {product_id}: {e}")
+    return ""
+
+
 # ── Extraction produit ────────────────────────────────────────────────────────
 def extract_product_name(invoice: dict) -> str:
-    # Champs plats
-    for key in ("product_title", "title", "name"):
+    # 1. Champs plats directs
+    for key in ("product_title", "product_name", "title", "name"):
         v = invoice.get(key)
         if v and isinstance(v, str):
             return v
 
-    # Objet ou liste
+    # 2. Objet "product" ou liste "products"
     raw = invoice.get("products") or invoice.get("product")
     if isinstance(raw, list) and raw:
         parts = []
         for p in raw:
-            n = (p.get("title") or p.get("name")) if isinstance(p, dict) else str(p)
+            if isinstance(p, dict):
+                n = p.get("name") or p.get("title") or p.get("label")
+            else:
+                n = str(p)
             if n: parts.append(n)
-        return ", ".join(parts) or "N/A"
+        return ", ".join(parts) or ""
     if isinstance(raw, dict):
-        return raw.get("title") or raw.get("name") or "N/A"
+        return raw.get("name") or raw.get("title") or raw.get("label") or ""
     if isinstance(raw, str) and raw:
         return raw
 
-    return "N/A"
+    # 3. Lookup dans le cache via product_id
+    pid = invoice.get("product_id")
+    if not pid and isinstance(invoice.get("product"), dict):
+        pid = invoice["product"].get("id")
+    if pid and int(pid) in products_cache:
+        return products_cache[int(pid)]
+
+    return ""
 
 
 # ── Build embed ───────────────────────────────────────────────────────────────
@@ -116,7 +174,7 @@ def build_embed(invoice: dict) -> discord.Embed:
         created_fmt = str(created_raw)
 
     symbol       = CURRENCY_SYMBOLS.get(currency, currency)
-    product_name = extract_product_name(invoice)
+    product_name = invoice.get("_resolved_product") or extract_product_name(invoice) or "N/A"
     is_paid      = status == "completed"
 
     # Méthode de paiement
@@ -167,6 +225,10 @@ async def poll_loop():
     print(f"[✓] Polling toutes les {POLL_INTERVAL}s  →  #{channel.name}")
 
     async with aiohttp.ClientSession() as session:
+        # Pré-chargement du catalogue produits
+        global products_cache
+        products_cache = await fetch_all_products(session)
+
         while not client.is_closed():
             try:
                 invoices = await fetch_invoices(session)
@@ -185,12 +247,26 @@ async def poll_loop():
                         status = inv.get("status", "").lower()
 
                         if status in NOTIFY_STATUSES:
-                            # Appel détaillé pour récupérer le produit
+                            # Appel détaillé pour récupérer tous les champs
                             detail = await fetch_invoice_detail(session, inv_id)
                             full   = {**inv, **detail} if detail else inv
-                            embed  = build_embed(full)
+
+                            # Si produit encore inconnu → lookup par product_id
+                            product_name = extract_product_name(full)
+                            if not product_name:
+                                pid = full.get("product_id")
+                                if not pid and isinstance(full.get("product"), dict):
+                                    pid = full["product"].get("id")
+                                if pid:
+                                    product_name = await fetch_product_name(session, int(pid))
+
+                            # Injecte le nom résolu dans le dict pour l'embed
+                            if product_name:
+                                full["_resolved_product"] = product_name
+
+                            embed = build_embed(full)
                             await channel.send(embed=embed)
-                            print(f"[→] {inv_id}  ({status})  produit: {extract_product_name(full)}")
+                            print(f"[→] {inv_id}  ({status})  produit: {product_name or 'N/A'}")
 
             except Exception as e:
                 print(f"[ERROR] poll_loop: {e}")
