@@ -14,6 +14,7 @@ SHOP_ID          = os.getenv("SHOP_ID", "218070")
 CHANNEL_ID       = int(os.getenv("CHANNEL_ID", "1481554434168328193"))
 POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "30"))
 NOTIFY_STATUSES  = [s.strip().lower() for s in os.getenv("NOTIFY_STATUS", "completed,pending").split(",")]
+PING_USER_ID     = int(os.getenv("PING_USER_ID", "1440399490229207151"))
 
 SELLAUTH_BASE    = "https://api.sellauth.com/v1"
 
@@ -311,7 +312,8 @@ async def poll_loop():
                         product_name = await resolve_product(session, full)
 
                         embed = build_embed(full, product_name)
-                        await channel.send(embed=embed)
+                        content = f"<@{PING_USER_ID}>" if status == "completed" else None
+                        await channel.send(content=content, embed=embed)
                         print(f"[→] {inv_id}  ({status})  produit: {product_name}")
 
             except Exception as e:
