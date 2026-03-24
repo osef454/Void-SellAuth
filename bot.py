@@ -215,6 +215,52 @@ def format_date(raw) -> str:
         return str(raw) if raw else "N/A"
 
 
+def extract_deliverable(invoice: dict) -> str:
+    """Extrait la clé / licence / deliverable reçue par le client."""
+    # Cherche dans tous les champs possibles
+    for key in ("delivered_product", "deliverable", "deliverables",
+                "serial", "serials", "key", "keys", "license",
+                "license_key", "product_key", "delivery", "delivered"):
+        val = invoice.get(key)
+        if not val:
+            continue
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, list):
+            parts = []
+            for item in val:
+                if isinstance(item, dict):
+                    v = item.get("value") or item.get("key") or item.get("serial") or item.get("content")
+                    if v:
+                        parts.append(str(v))
+                elif item:
+                    parts.append(str(item))
+            if parts:
+                return "\n".join(parts)
+        if isinstance(val, dict):
+            v = val.get("value") or val.get("key") or val.get("serial") or val.get("content")
+            if v:
+                return str(v)
+
+    # Chercher dans les sous-objets (items, product, etc.)
+    for key in ("items", "order_items", "invoice_items"):
+        items = invoice.get(key)
+        if isinstance(items, list):
+            parts = []
+            for item in items:
+                if isinstance(item, dict):
+                    for sub_key in ("delivered_product", "deliverable", "serial",
+                                    "key", "license", "product_key", "value", "content"):
+                        v = item.get(sub_key)
+                        if v and isinstance(v, str) and v.strip():
+                            parts.append(v.strip())
+                            break
+            if parts:
+                return "\n".join(parts)
+
+    return ""
+
+
 def build_embed(invoice: dict, product_name: str) -> discord.Embed:
     status   = invoice.get("status", "unknown").lower()
     inv_id   = invoice.get("id", "N/A")
@@ -227,6 +273,8 @@ def build_embed(invoice: dict, product_name: str) -> discord.Embed:
     pm = invoice.get("payment_method") or invoice.get("gateway", "N/A")
     if isinstance(pm, dict):
         pm = pm.get("name") or "N/A"
+
+    deliverable = extract_deliverable(invoice)
 
     embed = discord.Embed(
         title       = status_label(status),
@@ -244,6 +292,11 @@ def build_embed(invoice: dict, product_name: str) -> discord.Embed:
     completed_at = invoice.get("completed_at")
     if completed_at:
         embed.add_field(name="✅  Complété le", value=format_date(completed_at), inline=True)
+
+    if deliverable:
+        # Tronquer si trop long (limite Discord = 1024 chars par field)
+        display = deliverable if len(deliverable) <= 1000 else deliverable[:997] + "..."
+        embed.add_field(name="🔑  Clé / Deliverable", value=f"```\n{display}\n```", inline=False)
 
     embed.set_footer(text="Void SellAuth  •  Nouvelle transaction")
     return embed
